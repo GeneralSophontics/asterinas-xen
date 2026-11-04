@@ -3,7 +3,7 @@
 Read `docs/qubes-port/PLAN.md` first (§2, §4, §5), then `CLAUDE.md`, `AGENTS.md`,
 `kernel/core/comps/virtio/` (`virtio-blk`, `virtio-net` and how they register with the `block`
 and `network` components), `kernel/core/comps/block/`, `kernel/core/comps/network/`. Branch:
-`qubes-port/s4-frontends`. Sessions 2 and 3 are building `aster-xen` (PLAN §4) and the mock in
+`qubes-port-s4-frontends`. Sessions 2 and 3 are building `aster-xen` (PLAN §4) and the mock in
 parallel; code against the §4 traits and, if Session 3's mock is not on your branch, write the
 minimal mock you need (same shape as Session 3's description) behind feature `mock`.
 

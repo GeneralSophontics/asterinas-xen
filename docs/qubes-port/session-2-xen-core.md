@@ -5,7 +5,7 @@ Read `docs/qubes-port/PLAN.md` first (§2 facts, §4 interface, §5 conventions)
 `ostd/src/arch/x86/kernel/tsc.rs`, `kernel/core/comps/time/src/rtc/kvmclock.rs`,
 `ostd/src/arch/x86/cpu/cpuid.rs`, `kernel/core/comps/console/`, `kernel/core/comps/virtio/`
 (as the model for a bus + device component), and `ostd`'s IRQ and frame APIs. Branch:
-`qubes-port/s2-xen-core`. You have no Xen host; QEMU/TCG is your only runtime, and it is not Xen.
+`qubes-port-s2-xen-core`. You have no Xen host; QEMU/TCG is your only runtime, and it is not Xen.
 
 ## Goal
 
@@ -19,8 +19,10 @@ When Asterinas boots as a Xen PVH guest (detected by CPUID `0x40000000` = `XenVM
 2. maps `shared_info` (`XENMEM_add_to_physmap`, space `XENMAPSPACE_shared_info`) at a reserved
    gfn, registers `vcpu_info` for every vCPU (`VCPUOP_register_vcpu_info`) so vCPUs ≥ 32 work;
 3. takes the TSC frequency and wall clock from the pvclock in `shared_info` (reuse the KVM
-   pvclock code; both are `pvclock_vcpu_time_info` layout) and makes the `time` component work
-   with no PIT/HPET/RTC present (PVH on Xen has none; LAPIC timer + TSC deadline are available);
+   pvclock code in `ostd/src/arch/x86/kernel/kvm_clock.rs`; both are `pvclock_vcpu_time_info`
+   layout) and makes the `time` component work with no PIT/HPET/RTC present. This must hook in
+   ahead of the PIT fallback in `tsc::init_tsc_freq`, which panics on Xen today (PLAN §2); the
+   APIC timer then runs in TSC-deadline mode, which Xen advertises;
 4. installs the event-channel upcall vector, with the 2-level pending/mask scan, and the
    `Evtchn` trait from PLAN §4 (`alloc_unbound`, `bind_interdomain`, `bind_virq` for `VIRQ_TIMER`
    is optional, `close`, `notify`, `mask/unmask`, handlers);
@@ -30,14 +32,19 @@ When Asterinas boots as a Xen PVH guest (detected by CPUID `0x40000000` = `XenVM
    `GNTTABOP_map_grant_ref` with `GNTMAP_host_map` into a reserved, unpopulated gfn window above
    RAM (pick the window from the start_info memory map; document the choice), unmapped on drop;
 6. brings up the PV console (`HVM_PARAM_CONSOLE_PFN/EVTCHN`, `xencons_interface` ring) as a
-   console backend so that kernel logs reach `xl console`, with `HYPERVISOR_console_io`
-   (`CONSOLEIO_write`) as the earliest fallback before the ring exists;
+   console backend so that kernel logs reach `xl console`. The ring exists before the first
+   guest instruction, so bring it up right after the hypercall page and before anything that
+   can panic (PLAN §2: TSC calibration). `HYPERVISOR_console_io(CONSOLEIO_write)` is refused
+   for a domU on Qubes' release hypervisor (PLAN §2); keep it only as an optional
+   `xen.console_io` cmdline path for runs under the `xen-hypervisor-debug` package;
 7. brings up xenstore (`HVM_PARAM_STORE_PFN/EVTCHN`, `xenstore_domain_interface` ring, the
    `xs_wire.h` protocol with request ids, watches delivered on a channel, transactions) and the
    `Xenstore` trait; logs `domid`, `name` and `vm` at boot.
 
 Everything is gated on `is_xen()`; the non-Xen boot paths must be byte-for-byte unaffected in
-behaviour (both regression gates in PLAN §5 must pass).
+behaviour (both regression gates in PLAN §5 must pass). Do 1, 6 and 3 first and push them as a
+"Gate 0" commit before 2, 4, 5 and 7: that is the smallest kernel that can show Ivan a line on
+`xl console` instead of a silent panic.
 
 ## How to test without Xen
 
@@ -64,4 +71,8 @@ behaviour (both regression gates in PLAN §5 must pass).
 - `docs/qubes-port/REPORT-s2.md` per PLAN §5, plus a section "First Xen boot checklist" for
   Ivan: what `xl console` should print, what `xenstore-ls` in dom0 should show under the
   domain, and the `qvm-prefs`/kernel placement needed (kernel from dom0 as an ELF with the PVH
-  note; `initramfs` as the first module).
+  note; `initramfs` as the first module). For the very first boots prefer a hand-written
+  `xl create` config in dom0 (`type = "pvh"`, `kernel =`, `ramdisk =`, `vcpus = 1`,
+  `memory = maxmem`, no disks or vifs) over `qvm-start`, which kills a VM whose qrexec-agent
+  has not connected within `qrexec_timeout` (60 s by default); without a balloon driver the
+  guest sees `memory`, never `maxmem`, so keep them equal.

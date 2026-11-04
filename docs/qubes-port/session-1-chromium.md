@@ -3,7 +3,7 @@
 Read `docs/qubes-port/PLAN.md` first, then `CLAUDE.md`, `AGENTS.md`, `test/nixos/README.md`,
 `book/src/distro/popular-applications/web-browsers/README.md`, `test/nixos/tests/web-browsers/`,
 `test/nixos/tests/drm/`, and the `sctrace` docs (`tools/sctrace`, `book/`). Branch:
-`qubes-port/s1-chromium`. No Xen is involved in this session; everything is testable here.
+`qubes-port-s1-chromium`. No Xen is involved in this session; everything is testable here.
 
 ## Goal
 

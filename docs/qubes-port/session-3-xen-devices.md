@@ -5,7 +5,7 @@ Read `docs/qubes-port/PLAN.md` first (§2, §4, §5), then `CLAUDE.md`, `AGENTS.
 backed (`kernel/core/src/fs/fs_impls/ramfs/memfd.rs`, `kernel/core/src/vm/`), how `ioctl`s are
 dispatched (`kernel/core/src/syscall/ioctl.rs` and the ioctl infrastructure from 0.17), and
 how `/dev/dri` maps device memory (`kernel/comps/drm`, GEM dumb buffers) — that is the closest
-existing example of mmap over kernel-owned frames. Branch: `qubes-port/s3-xen-devices`.
+existing example of mmap over kernel-owned frames. Branch: `qubes-port-s3-xen-devices`.
 
 Session 2 is implementing the `aster-xen` crate (PLAN §4) in parallel on another branch. You
 code against the §4 traits and provide `kernel/comps/xen/src/mock.rs` behind a feature `mock`:
