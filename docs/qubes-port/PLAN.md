@@ -36,41 +36,100 @@ Asterinas (`2ea21cd`):
   `KVMKVMKVM`, so it stays off under Xen), `ostd/src/arch/x86/kernel/tsc.rs` and
   `kernel/core/comps/time/src/rtc/kvmclock.rs` know the KVM pvclock. Xen's `vcpu_time_info`
   in `shared_info` has the same layout.
-- Boot path under Xen PVH, as the tree stands: `tsc::init_tsc_freq` tries kvmclock, then CPUID
-  leaf 0x15, then the PIT. Xen's CPUID policy models basic leaves 0x0–0xd only
-  (`CPUID_GUEST_NR_BASIC` in `xen/include/xen/lib/x86/cpu-policy.h`), so leaf 0x15 reads as
-  zeros, and the PIT path maps ISA IRQ 0 through `IrqChip::map_gsi_pin_to`, which `unwrap()`s
-  on an empty I/O APIC list (`ostd/src/arch/x86/irq/chip/mod.rs`). libxl builds a PVH domU's
+- Boot path under Xen PVH, as the tree stands: `late_init_on_bsp` (`ostd/src/arch/x86/mod.rs`)
+  runs `irq::chip::init` three lines before `tsc::init_tsc_freq`. libxl builds a PVH domU's
   ACPI tables with `table_flags = 0` (`tools/libs/light/libxl_x86_acpi.c`), so `construct_madt`
-  in `tools/libacpi/build.c` emits LAPIC entries and no I/O APIC entry; the MADT itself exists
-  only while `apic` is on in the domain config, which is the default and which `irq::chip::init`
-  requires. So the first Xen boot **panics in TSC calibration**, silently (no serial). That
-  is the Gate 0 blocker; everything else at boot is already safe: the serial and i8042 drivers
-  probe before mapping an IRQ, the HPET is used only if ACPI lists one, and the APIC timer takes
-  the TSC-deadline path (`ostd/src/arch/x86/timer/apic.rs`), which Xen advertises to all HVM
-  guests (`TSC_DEADLINE` is `S` in `cpufeatureset.h`), so only the TSC frequency is needed.
+  in `tools/libacpi/build.c` emits LAPIC entries and no I/O APIC entry (and no interrupt source
+  overrides); the MADT exists while `apic` is on (the libxl default) or `vcpus > 1`, and
+  `irq::chip::init` `unwrap()`s its absence. With that MADT, `irq::chip::init`
+  (`ostd/src/arch/x86/irq/chip/mod.rs`) ends in `assert!(!io_apics.is_empty(), "No I/O APICs
+  found")`. So the first Xen boot **panics in `irq::chip::init`**, silently: the COM1 probe
+  fails (unhandled port I/O reads `0xff`), `early_print` has nowhere to write, and `abort()`
+  halts the domain, which from dom0 looks like a hang. Once that assert is relaxed,
+  `tsc::init_tsc_freq` is the next panic: kvmclock is signature-gated on `KVMKVMKVM` (Xen
+  presents `XenVMMXenVMM` at leaf 0x40000000), Xen's guest CPUID policy models basic leaves
+  0x0–0xd only (`CPUID_GUEST_NR_BASIC` in `xen/include/xen/lib/x86/cpu-policy.h`, so OSTD's
+  `cpuid()` returns `None` for leaf 0x15 without executing it), and the PIT path maps ISA IRQ 0
+  through `pit::enable_interrupt` → `map_isa_pin_to` → `IrqChip::map_gsi_pin_to`, which
+  `unwrap()`s on the empty I/O APIC list; a PVH domU emulates only the LAPIC
+  (`XEN_X86_EMU_LAPIC`: no I/O APIC, no PIT), so a non-panicking mapping would hang in the
+  calibration loop instead. The TSC frequency is available from Xen's CPUID leaf 0x40000003
+  subleaf 0 (`ECX` = tsc_khz) as well as from the pvclock. Those are the Gate 0 blockers; the
+  rest of the boot is safe on that machine: the serial probe (`ostd/src/arch/x86/serial.rs`)
+  fails on `0xff` reads (and is off anyway without the `earlycon` token); the i8042 driver
+  returns `NotPresent` because libxl's FADT leaves the 8042 boot-arch flag clear (do not pass
+  `i8042.exist`); the HPET driver in `timer/hpet.rs` is dead code on every platform; PCI probing
+  over `0xCF8/0xCFC` reads `0xffff` and finds nothing; the CMOS RTC is skipped on the FADT's
+  `NO_CMOS_RTC` flag and the time component falls back to the epoch; `iommu::init` finds no
+  DMAR and warns; `vm::init` is gated on the VMX CPUID bit, which Qubes' libvirt template
+  disables; the MADT's `PCAT_COMPAT` flag makes `pic::init_and_disable` poke ports of a PIC
+  that is not emulated, harmlessly. The APIC timer takes the TSC-deadline path
+  (`ostd/src/arch/x86/timer/apic.rs`) only if the host CPU has CPUID.1:ECX[24] and Xen passes
+  it through (`TSC_DEADLINE` is `S` in `cpufeatureset.h`, but `calculate_hvm_max_policy` starts
+  from the host policy and does not emulate the feature: many AMD hosts and Intel hosts with old
+  microcode lack it; check for `tsc_deadline_timer` in dom0's `/proc/cpuinfo`); otherwise
+  `init_periodic_mode_config` calibrates against the PIT, which is a third panic of the same
+  class, so Gate 0 needs a Xen-gated timer fallback too (a periodic LAPIC timer calibrated from
+  the TSC, or a `VIRQ_TIMER` tick).
+- Guest-physical layout a PVH domU sees (from `tools/libs/light/libxl_x86.c` and
+  `libxl_x86_acpi.c`): RAM from 0 up to the domain's `maxmem` (see the Qubes memory note below);
+  the kernel at `KERNEL_LMA` 0x8000000, so `memory` must comfortably exceed 128 MiB plus the
+  image plus the initramfs (the unstripped debug ELF spans [0x8000000, 0x943f858) and the NixOS
+  initramfs is 14 MB; about 170 MiB is the floor and Qubes' 400 MiB default is fine; libxc
+  rejects a kernel segment beyond `total_pages` with "segment kernel too large"); the ACPI
+  tables at 0xfc000000 as E820_ACPI, which Asterinas maps to `Reclaimable` and counts as
+  physical, so `mm::frame::meta::init` sizes its metadata up to there, about 63 MiB taken from
+  the domain's RAM and invisible under QEMU, whose tables sit inside RAM; the LAPIC at
+  0xfee00000; and the eight HVM special pages at 0xfeff8000–0xff000000 as E820_RESERVED
+  (console page = `special_pfn(7)` = 0xfefff000, xenstore page = `special_pfn(4)` =
+  0xfeffc000). Reserved pages are outside the linear mapping. `IoMem::acquire` succeeds only
+  inside [about 0xfc100000, 4 GiB) and above 4 GiB (`ostd/src/arch/x86/io/mod.rs`,
+  `ostd/src/io/io_mem/allocator.rs`), never in the gap between the top of RAM and 0xfc000000,
+  and it defaults to `Uncacheable` (`acquire_with_cache_policy(.., Writeback)` exists for
+  RAM-backed pages such as rings, `shared_info` and grant frames). The IoMem allocator is
+  initialised by `crate::io::init` at the *end* of `late_init_on_bsp`, after `irq::chip::init`
+  and TSC calibration; the only earlier mapping precedent is `io_mem_builder.reserve(..)` as
+  the xAPIC code does. `early_print` (`ostd/src/console/mod.rs`), the panic handler and
+  pre-logger log records write only to `SERIAL_PORT`, so a Xen console that only registers an
+  `aster_console` device shows nothing from `late_init_on_bsp`, where all the panics above
+  happen.
 - The kernel ELF is linked at `KERNEL_LMA = 0x8000000` with physical `p_paddr`s and a
-  `.note.Xen` section carrying `XEN_ELFNOTE_PHYS32_ENTRY` (`osdk/src/base_crate/x86_64.ld.template`).
-  Xen 4.19's libelf accepts an image whose only Xen note is `PHYS32_ENTRY` ("Found PVH image")
-  and, for an HVM container, substitutes `phys_entry` for the ELF entry before its bounds check
-  (`xen/common/libelf/libelf-dominfo.c`, `elf_xen_note_check` / `elf_xen_addr_calc_check`),
-  so the existing `BOOT_PROTOCOL=pvh` ELF is loadable by `xl`/libxl as is.
+  `.note.Xen` section carrying `XEN_ELFNOTE_PHYS32_ENTRY`, placed in a `PT_NOTE` program header
+  by the `note` PHDR of `osdk/src/base_crate/x86_64.ld.template` (libelf scans `PT_NOTE` first
+  and falls back to `SHT_NOTE` sections). The file OSDK emits for `vmm-direct`
+  (`target/osdk/asterinas-osdk-bin.elf`) is ELFCLASS64 with `e_machine` patched to `EM_386` for
+  QEMU's multiboot loader (`osdk/src/commands/build/bin.rs`); libelf keys on the class and, for
+  an HVM container, never consults the machine. Xen 4.19's libelf accepts an image whose only
+  Xen note is `PHYS32_ENTRY` ("Found PVH image") and, for an HVM container, substitutes
+  `phys_entry` for the ELF entry before its bounds check (`xen/common/libelf/libelf-dominfo.c`,
+  `elf_xen_note_check` / `elf_xen_addr_calc_check`); libxl dispatches `type = "pvh"` to
+  `libxl__build_hvm`, which sets `XC_DOM_HVM_CONTAINER`. So the existing `BOOT_PROTOCOL=pvh`
+  ELF is loadable by `xl`/libxl as is (a default multiboot2 build has no note and is rejected).
+  It is 170 MB unstripped; the initramfs OSDK stages next to it is the `ramdisk`, and it is
+  mandatory: with no module the kernel panics in `init.rs` for lack of a root filesystem.
 - `ostd/src/arch/x86/cpu/cpuid.rs` reads leaf `0x40000000` for the hypervisor signature.
 - Components: `kernel/core/comps/{block,console,device,framebuffer,input,network,nvme,pci,
   virtio,time,...}`, `kernel/comps/{drm,simpledrm,i8042,uart}`. Virtio block/net are the models
   for new frontends.
-- Syscalls present (`kernel/core/src/syscall/`): all 8 namespace types (`CLONE_NEWUSER/PID/NET/
-  IPC/NS/UTS/CGROUP/TIME`), `memfd_create`, `eventfd`, `epoll`, `timerfd`, `signalfd`, `inotify`,
+- Syscalls present (`kernel/core/src/syscall/`): namespaces of type `CLONE_NEWIPC/NEWNS/NEWUTS/
+  NEWCGROUP` only (`CLONE_NEWUSER/NEWPID/NEWNET/NEWTIME` return `EINVAL` from `clone`, `clone3`
+  and `unshare`: `kernel/core/src/process/clone.rs`, `kernel/core/src/namespace/`), `memfd_create`, `eventfd`, `epoll`, `timerfd`, `signalfd`, `inotify`,
   `socketpair`, `sendmsg`/`recvmsg` with `SCM_RIGHTS`, `futex`, `mremap`, `madvise`, `mprotect`,
   `prctl` (incl. `PR_SET_NO_NEW_PRIVS`), `ptrace`, `statx`, `fallocate`, `pidfd_*`,
   `sched_affinity`, `semget/semop/semctl`, `getrandom`, pty (`devpts`, `ptmx`).
 - Syscalls missing that matter here: `seccomp`, `shmget/shmat/shmdt/shmctl`, `rseq`,
   `pkey_*`, `io_uring_*`, `copy_file_range`, `splice`, `process_vm_readv`, `userfaultfd`
   (checked against `kernel/core/src/syscall/arch/x86.rs`). `clone3` **is** implemented
-  (`sys_clone3` in `kernel/core/src/syscall/clone.rs`). glibc and V8 fall back on `ENOSYS`
-  for `rseq` and `pkey_*`.
-- No `/dev/uinput` (the input subsystem exists). The Qubes gui-agent prefers `/dev/uinput` and
-  falls back to the `qubes` X input driver (`xf86-input-mfndev`).
+  (`sys_clone3` in `kernel/core/src/syscall/clone.rs`; it insists on `size == 88` and silently
+  ignores `CLONE_CLEAR_SIGHAND`, `CLONE_INTO_CGROUP`, `set_tid` and `cgroup`). glibc and V8
+  fall back on `ENOSYS` for `rseq` and `pkey_*`. The missing user, PID and network namespaces
+  break Chromium's layer-1 namespace sandbox and the setuid sandbox on their own, independently
+  of seccomp (row F): expect `--no-sandbox` until they exist.
+- No `/dev/uinput` (the input subsystem exists). The Qubes gui-agent uses `/dev/uinput` only
+  when the `gui-agent-virtual-input-device` qubes-service is enabled (it is not in the default
+  service set); otherwise, and on any uinput failure, it drives the `qubes` X input driver
+  (`xf86-input-mfndev`) over the AF_UNIX socket `/var/run/xf86-qubes-socket`. Row H is
+  therefore optional for Qubes input.
 - Graphics: DRM core, SimpleDRM, GEM dumb buffers, KMS; Xorg `modesetting` runs on Asterinas
   NixOS (`test/nixos/tests/drm`). Firefox is verified (`test/nixos/tests/web-browsers`).
   A patched systemd (`pkgs.aster_systemd`) is the init of Asterinas NixOS.
@@ -87,8 +146,14 @@ Qubes guest side (what the agents need from the kernel):
 - `libvchan` (`qubes-core-vchan-xen`): libxenstore (`xs_open`, `xs_read/write/rm/directory`,
   `xs_watch`, transactions) → `/dev/xen/xenbus`; libxenevtchn → `/dev/xen/evtchn`;
   libxengnttab / libxengntshr → `/dev/xen/gntdev`, `/dev/xen/gntalloc`.
-- `qrexec-agent` and `qubes-gui-agent`: libvchan only, plus `/dev/uinput` or the X FIFO driver,
-  `/dev/tty`.
+- `qrexec-agent` and `qubes-gui-agent`: libvchan and libqubesdb; the GUI agent additionally
+  needs `/dev/tty7` (systemd `TTYPath`, Xorg on `vt07`, `VT_ACTIVATE`), a PAM session with
+  D-Bus/logind, Xorg with the `dummyqbs` driver (`/dev/xen/gntalloc`, optionally
+  `/dev/dri/renderD128`), `RLIMIT_MEMLOCK` of 128 MiB for group `qubes`, the
+  `vm.compact_unevictable_allowed` sysctl, non-fatal writes to
+  `/sys/module/xen_gntalloc/parameters/limit` and `/sys/bus/pci/drivers/bochs-drm`, udev rules
+  (the `platform-pcspkr` seat tag), and either `/dev/uinput` or the `qubes` X input driver's
+  socket.
 - Xorg `dummyqbs` driver: `xengntshr_open/share_pages/unshare` (gntalloc) for the framebuffer;
   `GUIDomID` from the config. `xorg-qubes.conf.template` loads `fb` and `glamoregl`.
 - xgpu shim (`~/xgpu/shim`, `~/xgpu/sys/src/xen.rs`): `IOCTL_GNTDEV_MAP_GRANT_REF` /
@@ -98,16 +163,42 @@ Qubes guest side (what the agents need from the kernel):
   guests get ACPI tables (RSDP in `hvm_start_info`), a local APIC, no I/O APIC, no PCI bus, no
   PIT/HPET/RTC/serial. Unhandled port I/O reads as `0xff` and writes are dropped (harmless).
   Console, disk, network, xenstore are PV only.
-- `HYPERVISOR_console_io(CONSOLEIO_write)` from an unprivileged domU is **denied** by the
-  default XSM policy unless Xen was built with `CONFIG_VERBOSE_DEBUG` (`xen/include/xsm/dummy.h`,
-  `xsm_console_io`; the `is_console` escape hatch is set only by Arm dom0less code in 4.19).
-  Qubes' default hypervisor is a release build; the debug build ships as the
-  separate `xen-hypervisor-debug` package (`xen-<ver>~debug.gz`/`.efi`, selectable at boot), whose
-  `xl dmesg` then shows the writes. The PV console ring at `HVM_PARAM_CONSOLE_PFN` with
-  `HVM_PARAM_CONSOLE_EVTCHN` is set up by libxl before the domain runs, so it is the earliest
-  console a domU reliably has: hypercall page → `HVMOP_get_param` → write ring → `EVTCHNOP_send`.
-  Qubes boots PVH kernels from dom0 (`/var/lib/qubes/vm-kernels/<name>/vmlinuz` + `initramfs`,
-  as the PVH module list) or via pvgrub2-pvh from the guest disk.
+- `HYPERVISOR_console_io(CONSOLEIO_write)` from an unprivileged domU is **denied** by Xen's
+  built-in permission check (`xen/include/xsm/dummy.h`, `xsm_console_io`; Qubes builds without
+  XSM) unless Xen was built with `CONFIG_VERBOSE_DEBUG` or the domain is the console domain
+  (`is_console`, set only by Arm dom0less code in 4.19). Qubes' hypervisor config carries
+  `# CONFIG_VERBOSE_DEBUG is not set`, and its separate `xen-hypervisor-debug` package is built
+  from the same config with only `CONFIG_DEBUG`, `FRAME_POINTER` and `TRACEBUFFER` appended, so
+  `console_io` is refused under it too; seeing those writes needs a locally rebuilt Xen with
+  `CONFIG_VERBOSE_DEBUG=y` (plus `guest_loglvl=all` on a non-debug build, because domU output is
+  logged at `XENLOG_G_DEBUG`). Forget `console_io`. The PV console ring at
+  `HVM_PARAM_CONSOLE_PFN` with `HVM_PARAM_CONSOLE_EVTCHN` is provisioned by libxl/libxenguest
+  during domain build, before unpause, so it is the earliest console a domU reliably has. First
+  output needs three hypercalls after the hypercall page (an MSR write): `HVMOP_get_param` for
+  the pfn and for the port, then `EVTCHNOP_send` after writing the 2048-byte `out` ring and
+  bumping `out_prod` with a write barrier. The page is at gfn 0xfefff (E820_RESERVED: map it
+  explicitly, never treat it as RAM). xenconsoled attaches via the `console/{ring-ref,port,type}`
+  keys libxl writes, maps the page through grant ref 0 (refs 0–7 are reserved: never hand them
+  out), drains only on an event and rate-limits itself to 30 events per 200 ms, so a full ring
+  must be spun on (`out_cons`) and re-signalled; on Qubes its output lands in
+  `/var/log/xen/console/guest-<name>.log` even with no `xl console` attached.
+- Qubes boots PVH kernels from dom0 (`/var/lib/qubes/vm-kernels/<name>/vmlinuz` + `initramfs`,
+  as the PVH module list) or via pvgrub2-pvh from the guest disk. qubesd requires only
+  `vmlinuz` in that directory (`initramfs` and `modules.img` are optional to qubesd; Asterinas
+  needs the initramfs). The libvirt template (`templates/libvirt/xen.xml`) passes `<kernel>`,
+  `<initrd>` and `<cmdline>` straight to libxl and prepends Linux defaults
+  (`root=/dev/mapper/dmroot ro nomodeset console=hvc0 ... swiotlb=2048`) unless the qube has
+  the `no-default-kernelopts` feature; Asterinas forwards unknown words to init's argv and
+  environment, so set `qvm-features <vm> no-default-kernelopts 1` and a deliberate `kernelopts`.
+- Qubes memory: libxl builds the PVH e820 from `maxmem` and populates only `memory` worth of
+  pages (populate-on-demand); a guest without a balloon driver that touches more distinct pages
+  than `memory` is killed by Xen with nothing on the console. qubesd treats every PVH qube as
+  balloon-capable and defaults `maxmem` to 4000 MiB for a non-Linux `os` feature, so run
+  `qvm-prefs <vm> maxmem 0` (the template then emits `<memory>` = `memory`) before the first
+  `qvm-start`; for `xl create` simply omit `maxmem`. `qvm-start` kills a qube whose
+  qrexec-agent has not connected within `qrexec_timeout` (60 s) only when the `qrexec` feature
+  is set on the qube or its template; a fresh StandaloneVM without it is started with
+  `QREXEC_STARTUP_NOWAIT=1` and left running.
 
 ## 3. Gap table
 
@@ -117,10 +208,10 @@ Qubes guest side (what the agents need from the kernel):
 | B | xenstore ring + wire-protocol client with watches; PV console ring | kernel comps | ~1k | S2 |
 | C | blkfront, netfront | kernel comps | ~3k | S4 |
 | D | `/dev/xen/{evtchn,gntalloc,gntdev,xenbus}` with Linux ioctl ABI; mmap of foreign frames | kernel | ~2.5k (740+600+1200+700) | S3 |
-| E | Xen-PVH quirks: TSC frequency from the Xen pvclock ahead of the PIT fallback (today's Gate 0 panic, §2), no PCI, no legacy timers, early console blind until the console ring is up | OSTD | small | S2 |
-| F | seccomp-bpf (`seccomp`, `prctl(PR_SET_SECCOMP)`, `SIGSYS`, `/proc/self/status` Seccomp) | kernel | ~2k | S1 stretch |
+| E | Xen-PVH quirks: `IrqChip` constructible with zero I/O APICs and `map_gsi_pin_to`/`disable_gsi` returning errors instead of `unwrap()` (today's first Gate 0 panic, §2); TSC frequency from the Xen pvclock or CPUID leaf 0x40000003 ahead of the PIT fallback (the second); a Xen-gated LAPIC timer fallback for hosts without TSC-deadline (the third); the ring console wired into OSTD's `early_print`; `IoMem` windows chosen per the layout in §2; no PCI, no legacy timers | OSTD | small | S2 |
+| F | seccomp-bpf (`seccomp`, `prctl(PR_SET_SECCOMP)`, `SIGSYS`, `/proc/self/status` Seccomp), and user/PID/network namespaces (`EINVAL` today, §2), without which Chromium needs `--no-sandbox` | kernel | ~2k + namespaces | S1 stretch |
 | G | SysV shared memory (`shmget/shmat/shmdt/shmctl`, `/proc/sysvipc/shm`, `ipcs`) | kernel | ~0.5k | S1 |
-| H | `/dev/uinput` | kernel | ~0.3k | S1 |
+| H | `/dev/uinput` (optional for Qubes input, §2) | kernel | ~0.3k | S1 |
 | I | Chromium's remaining ENOSYS/EINVAL list, found with `sctrace` | kernel | handful | S1 |
 | J | Userland: init, qubesdb, qrexec-agent, gui-agent, Xorg, Mesa Venus, shim, chromium | packaging | — | later, on Qubes |
 

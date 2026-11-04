@@ -17,14 +17,18 @@ kernel features it needs, in this order of value:
    Verify with a C or Python test in the NixOS test, and with `ipcs -m`. Xorg's MIT-SHM and
    Chromium's `XShmImagePool` are the consumers; MIT-SHM must work (`xdpyinfo | grep MIT-SHM`,
    and a client actually using it, e.g. `xwd` or chromium itself).
-2. **`/dev/uinput`**: `UI_DEV_SETUP`/`UI_SET_EVBIT`/`UI_SET_KEYBIT`/`UI_SET_RELBIT`/
+2. **`/dev/uinput`** (optional for Qubes: the gui-agent uses it only when the
+   `gui-agent-virtual-input-device` service is enabled, PLAN §2; do it after 1 and 3):
+   `UI_DEV_SETUP`/`UI_SET_EVBIT`/`UI_SET_KEYBIT`/`UI_SET_RELBIT`/
    `UI_SET_ABSBIT`/`UI_ABS_SETUP`/`UI_DEV_CREATE`/`UI_DEV_DESTROY`, writes of `input_event`
    delivered to `/dev/input/eventN` and to Xorg (`libinput`/`evdev`). Verify with `evtest` or
    `python-evdev`. Keep the older `UI_DEV_SETUP`-less path (`write` of `uinput_user_dev`) too:
    the Qubes gui-agent may use either.
 3. **Chromium's syscall gaps**: run chromium under `sctrace` (and `strace` if it works there)
    with `--no-sandbox --disable-gpu` first, then `--no-sandbox` with software GL, then without
-   `--no-sandbox` (the layer-1 namespace sandbox is expected to work; seccomp-bpf is not).
+   `--no-sandbox` (neither sandbox layer can work today: user, PID and network namespaces
+   return `EINVAL` (PLAN §2) and seccomp is missing; record what Chromium's sandbox probes do
+   and whether `--no-sandbox` is the only outcome).
    For every `ENOSYS`/`EINVAL`/`EOPNOTSUPP`/crash, decide: implement (small, clean), stub
    (document why it is safe), or record as "needs row F". `clone3`, `rseq`, `pkey_*` are
    expected to return `ENOSYS` and be tolerated; confirm that.
