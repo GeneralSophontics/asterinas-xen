@@ -40,8 +40,11 @@ Asterinas (`2ea21cd`):
   leaf 0x15, then the PIT. Xen's CPUID policy models basic leaves 0x0–0xd only
   (`CPUID_GUEST_NR_BASIC` in `xen/include/xen/lib/x86/cpu-policy.h`), so leaf 0x15 reads as
   zeros, and the PIT path maps ISA IRQ 0 through `IrqChip::map_gsi_pin_to`, which `unwrap()`s
-  on an empty I/O APIC list (`ostd/src/arch/x86/irq/chip/mod.rs`). A PVH domU has a MADT with
-  no I/O APIC, so the first Xen boot **panics in TSC calibration**, silently (no serial). That
+  on an empty I/O APIC list (`ostd/src/arch/x86/irq/chip/mod.rs`). libxl builds a PVH domU's
+  ACPI tables with `table_flags = 0` (`tools/libs/light/libxl_x86_acpi.c`), so `construct_madt`
+  in `tools/libacpi/build.c` emits LAPIC entries and no I/O APIC entry; the MADT itself exists
+  only while `apic` is on in the domain config, which is the default and which `irq::chip::init`
+  requires. So the first Xen boot **panics in TSC calibration**, silently (no serial). That
   is the Gate 0 blocker; everything else at boot is already safe: the serial and i8042 drivers
   probe before mapping an IRQ, the HPET is used only if ACPI lists one, and the APIC timer takes
   the TSC-deadline path (`ostd/src/arch/x86/timer/apic.rs`), which Xen advertises to all HVM
@@ -97,7 +100,8 @@ Qubes guest side (what the agents need from the kernel):
   Console, disk, network, xenstore are PV only.
 - `HYPERVISOR_console_io(CONSOLEIO_write)` from an unprivileged domU is **denied** by the
   default XSM policy unless Xen was built with `CONFIG_VERBOSE_DEBUG` (`xen/include/xsm/dummy.h`,
-  `xsm_console_io`). Qubes' default hypervisor is a release build; the debug build ships as the
+  `xsm_console_io`; the `is_console` escape hatch is set only by Arm dom0less code in 4.19).
+  Qubes' default hypervisor is a release build; the debug build ships as the
   separate `xen-hypervisor-debug` package (`xen-<ver>~debug.gz`/`.efi`, selectable at boot), whose
   `xl dmesg` then shows the writes. The PV console ring at `HVM_PARAM_CONSOLE_PFN` with
   `HVM_PARAM_CONSOLE_EVTCHN` is set up by libxl before the domain runs, so it is the earliest

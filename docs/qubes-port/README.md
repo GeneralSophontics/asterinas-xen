@@ -43,3 +43,14 @@ trusts the proxy CA: add
 to every `docker run` (without it, `make` dies in `install_osdk` with
 `invalid peer certificate: UnknownIssuer` three seconds in). The image is 16.5 GB on disk and
 pulls in about four minutes.
+
+Measured in this environment on 2026-11-04 at `2ea21cd` (4 vCPUs, TCG, both PLAN §5 gates
+green):
+
+| gate | wall clock | notes |
+|---|---|---|
+| `make run_kernel ENABLE_KVM=0 AUTO_TEST=boot` | 315 s | includes the rustup target download, the Nix initramfs from the binary cache and the first full kernel build |
+| `make run_kernel ENABLE_KVM=0 BOOT_PROTOCOL=pvh AUTO_TEST=boot` | 189 s | incremental build plus boot |
+
+TCG does not expose TSC-deadline, so under QEMU the APIC timer takes the PIT-calibrated path;
+a real Xen host exercises the deadline path instead. Neither gate says anything about Xen.
