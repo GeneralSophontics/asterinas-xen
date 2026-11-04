@@ -30,8 +30,8 @@ kernel features it needs, in this order of value:
    return `EINVAL` (PLAN §2) and seccomp is missing; record what Chromium's sandbox probes do
    and whether `--no-sandbox` is the only outcome).
    For every `ENOSYS`/`EINVAL`/`EOPNOTSUPP`/crash, decide: implement (small, clean), stub
-   (document why it is safe), or record as "needs row F". `clone3`, `rseq`, `pkey_*` are
-   expected to return `ENOSYS` and be tolerated; confirm that.
+   (document why it is safe), or record as "needs row F". `rseq` and `pkey_*` are
+   expected to return `ENOSYS` and be tolerated (`clone3` is implemented, PLAN §2); confirm that.
 4. **Stretch, only if 1–3 are done and pushed**: seccomp-bpf filter mode
    (`seccomp(SECCOMP_SET_MODE_FILTER)`, `prctl(PR_SET_SECCOMP)`, `SECCOMP_RET_KILL/TRAP/ERRNO/
    ALLOW/LOG`, `SIGSYS` with `si_syscall`, `TSYNC`, `Seccomp:` in `/proc/self/status`). cBPF

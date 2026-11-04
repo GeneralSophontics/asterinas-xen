@@ -66,15 +66,17 @@ Asterinas (`2ea21cd`):
   that is not emulated, harmlessly. The APIC timer takes the TSC-deadline path
   (`ostd/src/arch/x86/timer/apic.rs`) only if the host CPU has CPUID.1:ECX[24] and Xen passes
   it through (`TSC_DEADLINE` is `S` in `cpufeatureset.h`, but `calculate_hvm_max_policy` starts
-  from the host policy and does not emulate the feature: many AMD hosts and Intel hosts with old
-  microcode lack it; check for `tsc_deadline_timer` in dom0's `/proc/cpuinfo`); otherwise
+  from the host policy and never force-sets it, so Xen's software TSC-deadline emulation in
+  `vlapic.c` is offered only when the host CPU has the bit: AMD parts commonly lack it, as do
+  Haswell-to-Kaby-Lake hosts whose microcode predates `deadline_match[]` in
+  `xen/arch/x86/apic.c`; check for `tsc_deadline_timer` in dom0's `/proc/cpuinfo`); otherwise
   `init_periodic_mode_config` calibrates against the PIT, which is a third panic of the same
   class, so Gate 0 needs a Xen-gated timer fallback too (a periodic LAPIC timer calibrated from
   the TSC, or a `VIRQ_TIMER` tick).
 - Guest-physical layout a PVH domU sees (from `tools/libs/light/libxl_x86.c` and
   `libxl_x86_acpi.c`): RAM from 0 up to the domain's `maxmem` (see the Qubes memory note below);
   the kernel at `KERNEL_LMA` 0x8000000, so `memory` must comfortably exceed 128 MiB plus the
-  image plus the initramfs (the unstripped debug ELF spans [0x8000000, 0x943f858) and the NixOS
+  image plus the initramfs (the debug build's loadable segments span [0x8000000, 0x943f858) and the NixOS
   initramfs is 14 MB; about 170 MiB is the floor and Qubes' 400 MiB default is fine; libxc
   rejects a kernel segment beyond `total_pages` with "segment kernel too large"); the ACPI
   tables at 0xfc000000 as E820_ACPI, which Asterinas maps to `Reclaimable` and counts as
@@ -98,8 +100,10 @@ Asterinas (`2ea21cd`):
   by the `note` PHDR of `osdk/src/base_crate/x86_64.ld.template` (libelf scans `PT_NOTE` first
   and falls back to `SHT_NOTE` sections). The file OSDK emits for `vmm-direct`
   (`target/osdk/asterinas-osdk-bin.elf`) is ELFCLASS64 with `e_machine` patched to `EM_386` for
-  QEMU's multiboot loader (`osdk/src/commands/build/bin.rs`); libelf keys on the class and, for
-  an HVM container, never consults the machine. Xen 4.19's libelf accepts an image whose only
+  QEMU's multiboot loader (`osdk/src/commands/build/bin.rs`); libelf keys on the class and looks
+  at `e_machine` only to reject a note-less x86 image (and to detect Arm), and
+  `xc_dom_guest_type` returns `hvm-3.0-x86_32` before its machine switch, so the patched value
+  is irrelevant. Xen 4.19's libelf accepts an image whose only
   Xen note is `PHYS32_ENTRY` ("Found PVH image") and, for an HVM container, substitutes
   `phys_entry` for the ELF entry before its bounds check (`xen/common/libelf/libelf-dominfo.c`,
   `elf_xen_note_check` / `elf_xen_addr_calc_check`); libxl dispatches `type = "pvh"` to
@@ -113,7 +117,7 @@ Asterinas (`2ea21cd`):
   for new frontends.
 - Syscalls present (`kernel/core/src/syscall/`): namespaces of type `CLONE_NEWIPC/NEWNS/NEWUTS/
   NEWCGROUP` only (`CLONE_NEWUSER/NEWPID/NEWNET/NEWTIME` return `EINVAL` from `clone`, `clone3`
-  and `unshare`: `kernel/core/src/process/clone.rs`, `kernel/core/src/namespace/`), `memfd_create`, `eventfd`, `epoll`, `timerfd`, `signalfd`, `inotify`,
+  and `unshare`: `kernel/core/src/process/clone.rs`, `kernel/core/src/process/namespace/`), `memfd_create`, `eventfd`, `epoll`, `timerfd`, `signalfd`, `inotify`,
   `socketpair`, `sendmsg`/`recvmsg` with `SCM_RIGHTS`, `futex`, `mremap`, `madvise`, `mprotect`,
   `prctl` (incl. `PR_SET_NO_NEW_PRIVS`), `ptrace`, `statx`, `fallocate`, `pidfd_*`,
   `sched_affinity`, `semget/semop/semctl`, `getrandom`, pty (`devpts`, `ptmx`).
@@ -169,7 +173,9 @@ Qubes guest side (what the agents need from the kernel):
   (`is_console`, set only by Arm dom0less code in 4.19). Qubes' hypervisor config carries
   `# CONFIG_VERBOSE_DEBUG is not set`, and its separate `xen-hypervisor-debug` package is built
   from the same config with only `CONFIG_DEBUG`, `FRAME_POINTER` and `TRACEBUFFER` appended, so
-  `console_io` is refused under it too; seeing those writes needs a locally rebuilt Xen with
+  `console_io` is refused under it too (derived from the spec and kconfig's handling of an
+  explicit `n`; confirm on a Qubes host with `grep VERBOSE_DEBUG /boot/xen-*~debug.config`);
+  seeing those writes needs a locally rebuilt Xen with
   `CONFIG_VERBOSE_DEBUG=y` (plus `guest_loglvl=all` on a non-debug build, because domU output is
   logged at `XENLOG_G_DEBUG`). Forget `console_io`. The PV console ring at
   `HVM_PARAM_CONSOLE_PFN` with `HVM_PARAM_CONSOLE_EVTCHN` is provisioned by libxl/libxenguest
@@ -186,14 +192,17 @@ Qubes guest side (what the agents need from the kernel):
   as the PVH module list) or via pvgrub2-pvh from the guest disk. qubesd requires only
   `vmlinuz` in that directory (`initramfs` and `modules.img` are optional to qubesd; Asterinas
   needs the initramfs). The libvirt template (`templates/libvirt/xen.xml`) passes `<kernel>`,
-  `<initrd>` and `<cmdline>` straight to libxl and prepends Linux defaults
-  (`root=/dev/mapper/dmroot ro nomodeset console=hvc0 ... swiotlb=2048`) unless the qube has
-  the `no-default-kernelopts` feature; Asterinas forwards unknown words to init's argv and
-  environment, so set `qvm-features <vm> no-default-kernelopts 1` and a deliberate `kernelopts`.
+  `<initrd>` and `<cmdline>` straight to libxl and prepends `kernelopts_common`
+  (`root=/dev/mapper/dmroot ro nomodeset console=hvc0 rd_NO_PLYMOUTH ... xen_privcmd.unrestricted`)
+  to the qube's `kernelopts` (default `swiotlb=2048`) unless the qube has the
+  `no-default-kernelopts` feature, which drops only the common part; Asterinas forwards unknown
+  words to init's argv and environment, so set `qvm-features <vm> no-default-kernelopts 1` and
+  a deliberate `kernelopts`.
 - Qubes memory: libxl builds the PVH e820 from `maxmem` and populates only `memory` worth of
   pages (populate-on-demand); a guest without a balloon driver that touches more distinct pages
   than `memory` is killed by Xen with nothing on the console. qubesd treats every PVH qube as
-  balloon-capable and defaults `maxmem` to 4000 MiB for a non-Linux `os` feature, so run
+  balloon-capable and defaults `maxmem` to 4000 MiB (capped at half the host's RAM) for a
+  non-Linux `os` feature, so run
   `qvm-prefs <vm> maxmem 0` (the template then emits `<memory>` = `memory`) before the first
   `qvm-start`; for `xl create` simply omit `maxmem`. `qvm-start` kills a qube whose
   qrexec-agent has not connected within `qrexec_timeout` (60 s) only when the `qrexec` feature

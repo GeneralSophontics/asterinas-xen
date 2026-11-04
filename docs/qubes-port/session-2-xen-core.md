@@ -37,8 +37,8 @@ When Asterinas boots as a Xen PVH guest (detected by CPUID `0x40000000` = `XenVM
    reserves for the console and xenstore mappings) and the `Grants` trait:
    `grant_access`/`end_access` over the entry array, and `map_foreign` through
    `GNTTABOP_map_grant_ref` with `GNTMAP_host_map` into an unpopulated gfn window that `IoMem`
-   can map (PLAN §2: not "just above RAM", which the allocator refuses; below 0xfee00000 or
-   above 4 GiB; document the choice), unmapped on drop;
+   can map (PLAN §2: not "just above RAM", which the allocator refuses; just below 0xfee00000,
+   i.e. inside [0xfc100000, 0xfee00000), or above 4 GiB; document the choice), unmapped on drop;
 6. brings up the PV console (`HVM_PARAM_CONSOLE_PFN/EVTCHN`, `xencons_interface` ring: 1024
    bytes in, 2048 out, four indices) in two layers: inside OSTD as a sink for
    `ostd::console::early_print`, so the panic handler and pre-logger records reach `xl console`
